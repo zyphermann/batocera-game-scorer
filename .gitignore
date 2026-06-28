@@ -1,0 +1,17 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Local generated data and exports
+*.csv
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Local credentials
+mobygames_api_key.txt
+
+# Local logs/temp files
+*.log
+tmp/
+temp/
