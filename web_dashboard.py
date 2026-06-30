@@ -556,21 +556,38 @@ def render_page(db_path: Path, params: dict[str, list[str]]) -> bytes:
     if job:
         status = "running" if job.get("running") else f"done ({job.get('returncode')})"
         job_text = f"{job['name']} - {status}"
+        job_key = f"{job.get('name')}:{job.get('started_at')}:{job.get('running')}:{job.get('returncode')}"
     else:
         job_text = ""
+        job_key = "logs"
     log_text = "\n".join(esc(line) for line in logs[-120:])
     if game:
         game_status = "running" if game.get("running") else f"done ({game.get('returncode')})"
         game_text = f"{game.get('title')} [{game.get('system')}] - {game_status}"
     else:
-        game_text = ""
+        game_text = "No game running"
     game_log_text = "\n".join(esc(line) for line in game_logs[-80:])
-    game_section = ""
-    if game or game_logs:
-        game_section = f'<section class="job"><strong>{esc(game_text)}</strong><pre>{game_log_text}</pre></section>'
+    stop_disabled = "" if game and game.get("running") else "disabled"
+    game_log_block = f"<pre>{game_log_text}</pre>" if game_logs else ""
+    game_section = f"""
+      <section class="job status-panel game-panel">
+        <div class="panel-title"><strong>{esc(game_text)}</strong></div>
+        <form method="post" action="/action" class="panel-action">
+          <input type="hidden" name="action" value="stop_game">
+          <button type="submit" {stop_disabled}>Stop Game</button>
+        </form>
+        {game_log_block}
+      </section>
+    """
     job_section = ""
     if job or logs:
-        job_section = f'<section class="job"><strong>{esc(job_text)}</strong><pre>{log_text}</pre></section>'
+        job_section = f"""
+      <section class="job status-panel dismissible" id="job-section" data-dismiss-key="{esc(job_key)}">
+        <div class="panel-title"><strong>{esc(job_text)}</strong></div>
+        <button type="button" class="panel-close" title="Close" aria-label="Close" onclick="dismissPanel('job-section')">X</button>
+        <pre>{log_text}</pre>
+      </section>
+    """
     prev_page = max(1, page - 1)
     next_page = min(total_pages, page + 1)
     base_query = (
@@ -593,7 +610,23 @@ def render_page(db_path: Path, params: dict[str, list[str]]) -> bytes:
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta http-equiv="refresh" content="30">
-  <title>Batocera Game Scorer</title>
+  <title>Batocera Game Scorer - {esc(stats["games"])} Games</title>
+  <script>
+    function dismissPanel(id) {{
+      const panel = document.getElementById(id);
+      if (!panel) return;
+      localStorage.setItem("dismissed:" + id, panel.dataset.dismissKey || "");
+      panel.hidden = true;
+    }}
+    document.addEventListener("DOMContentLoaded", function () {{
+      document.querySelectorAll(".dismissible").forEach(function (panel) {{
+        const dismissedKey = localStorage.getItem("dismissed:" + panel.id);
+        if (dismissedKey && dismissedKey === panel.dataset.dismissKey) {{
+          panel.hidden = true;
+        }}
+      }});
+    }});
+  </script>
   <style>
     :root {{
       --bg: #f6f7f8;
@@ -648,6 +681,9 @@ def render_page(db_path: Path, params: dict[str, list[str]]) -> bytes:
       align-items: center;
       flex-wrap: wrap;
     }}
+    .status-panel {{ position: relative; }}
+    .panel-title {{ padding-right: 34px; }}
+    .panel-action {{ margin-left: auto; }}
     label {{ color: var(--muted); font-size: 13px; }}
     select, input {{
       height: 36px;
@@ -671,6 +707,23 @@ def render_page(db_path: Path, params: dict[str, list[str]]) -> bytes:
       align-items: center;
     }}
     button:hover, .button:hover {{ background: var(--accent-dark); }}
+    button.panel-close {{
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      width: 28px;
+      height: 28px;
+      padding: 0;
+      justify-content: center;
+      background: #e2e8ee;
+      color: var(--ink);
+      font-weight: 800;
+    }}
+    button.panel-close:hover {{ background: #cbd5de; }}
+    button:disabled, button:disabled:hover {{
+      background: #b8c4cc;
+      cursor: not-allowed;
+    }}
     table {{
       width: 100%;
       border-collapse: collapse;
@@ -713,11 +766,11 @@ def render_page(db_path: Path, params: dict[str, list[str]]) -> bytes:
 </head>
 <body>
   <header>
-    <h1>Batocera Game Scorer</h1>
+    <h1>Batocera Game Scorer - {esc(stats["games"])} Games</h1>
     <div class="muted">{esc(db_path)}</div>
   </header>
   <main>
-    <section class="stats">{cards}</section>
+    {job_section}
     <form class="toolbar" method="get" action="/">
       <label>View <select name="view">{view_options}</select></label>
       <label>Search <input name="q" value="{esc(search)}" size="18" placeholder="title or system"></label>
@@ -727,6 +780,9 @@ def render_page(db_path: Path, params: dict[str, list[str]]) -> bytes:
       <input type="hidden" name="dir" value="{esc(direction)}">
       <button type="submit">Show</button>
     </form>
+    <div class="tablewrap"><table><thead><tr>{header}</tr></thead><tbody>{table_body}</tbody></table></div>
+    {pagination}
+    {game_section}
     <section class="actions">
       <form method="post" action="/action"><input type="hidden" name="action" value="scan"><button type="submit">Update Playtime</button></form>
       <form method="post" action="/action"><input type="hidden" name="action" value="refresh"><button type="submit">Refresh Scores</button></form>
@@ -735,13 +791,8 @@ def render_page(db_path: Path, params: dict[str, list[str]]) -> bytes:
         <label>Moby limit <input name="limit" value="250" inputmode="numeric" size="5"></label>
         <button type="submit">Continue MobyGames</button>
       </form>
-      <form method="post" action="/action"><input type="hidden" name="action" value="stop_game"><button type="submit">Stop Game</button></form>
     </section>
-    {game_section}
-    {job_section}
-    {pagination}
-    <div class="tablewrap"><table><thead><tr>{header}</tr></thead><tbody>{table_body}</tbody></table></div>
-    {pagination}
+    <section class="stats">{cards}</section>
   </main>
 </body>
 </html>"""
