@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import http.client
 import json
 import os
 import re
+import socket
 import sqlite3
+import ssl
 import sys
 import time
 import urllib.error
@@ -28,6 +31,20 @@ import arcade_db
 API_BASE_URL = "https://api.mobygames.com/v1"
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_TOKEN_PATH = SCRIPT_DIR / "mobygames_api_key.txt"
+RATE_LIMIT_BUFFER_SECONDS = 5
+RATE_LIMIT_STATUS_INTERVAL_SECONDS = 10
+NETWORK_RETRY_INITIAL_SECONDS = 30
+NETWORK_RETRY_MAX_SECONDS = 300
+TRANSIENT_HTTP_STATUSES = {408, 500, 502, 503, 504}
+NETWORK_ERRORS = (
+    ConnectionError,
+    TimeoutError,
+    socket.timeout,
+    urllib.error.URLError,
+    http.client.HTTPException,
+    http.client.IncompleteRead,
+    ssl.SSLError,
+)
 
 SYSTEM_TO_PLATFORM = {
     "3do": "3DO",
@@ -110,6 +127,41 @@ def load_api_key(cli_api_key: str | None, token_file: Path) -> str:
     return ""
 
 
+def rate_limit_wait_seconds(payload: Any, default_seconds: int = 3600) -> int:
+    if isinstance(payload, dict):
+        retry_after = payload.get("retry_after") or payload.get("reset_in") or payload.get("seconds")
+        if isinstance(retry_after, int | float):
+            return max(1, int(retry_after))
+
+        message = str(payload.get("message", ""))
+        match = re.search(r"reset in (\d+) seconds", message, re.IGNORECASE)
+        if match:
+            return max(1, int(match.group(1)))
+
+        match = re.search(r"(\d+)\s*seconds", message, re.IGNORECASE)
+        if match:
+            return max(1, int(match.group(1)))
+
+    return default_seconds
+
+
+def cache_delete(conn: sqlite3.Connection, cache_key: str) -> None:
+    conn.execute("DELETE FROM api_cache WHERE cache_key = ?", (cache_key,))
+
+
+def wait_with_status(wait_seconds: int) -> None:
+    remaining = max(1, int(wait_seconds))
+    while remaining > 0:
+        print(f"Waiting {remaining} seconds before retrying...", flush=True)
+        sleep_for = min(RATE_LIMIT_STATUS_INTERVAL_SECONDS, remaining)
+        time.sleep(sleep_for)
+        remaining -= sleep_for
+
+
+def next_network_retry_seconds(current_seconds: int) -> int:
+    return min(NETWORK_RETRY_MAX_SECONDS, max(NETWORK_RETRY_INITIAL_SECONDS, current_seconds * 2))
+
+
 class MobyClient:
     def __init__(self, api_key: str, conn: sqlite3.Connection, sleep_seconds: float, max_requests: int | None) -> None:
         self.api_key = api_key
@@ -120,9 +172,6 @@ class MobyClient:
         self.last_request_at = 0.0
 
     def get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
-        if self.max_requests is not None and self.uncached_requests >= self.max_requests:
-            raise RuntimeError(f"Reached --max-requests={self.max_requests}")
-
         full_params = {**params, "api_key": self.api_key}
         query = urllib.parse.urlencode(full_params, doseq=True)
         url = f"{API_BASE_URL}{path}?{query}"
@@ -131,29 +180,84 @@ class MobyClient:
         cached = arcade_db.cache_get(self.conn, cache_key)
         if cached:
             status, response = cached
-            if status >= 400:
+            if status == 429:
+                cache_delete(self.conn, cache_key)
+                self.conn.commit()
+            elif status >= 400:
                 raise RuntimeError(f"Cached API error {status}: {response}")
-            return response
+            else:
+                return response
 
-        elapsed = time.time() - self.last_request_at
-        if self.last_request_at and elapsed < self.sleep_seconds:
-            time.sleep(self.sleep_seconds - elapsed)
+        network_retry_seconds = NETWORK_RETRY_INITIAL_SECONDS
+        while True:
+            cached = arcade_db.cache_get(self.conn, cache_key)
+            if cached:
+                status, response = cached
+                if status == 429:
+                    cache_delete(self.conn, cache_key)
+                    self.conn.commit()
+                    continue
+                if status >= 400:
+                    raise RuntimeError(f"Cached API error {status}: {response}")
+                return response
 
-        req = urllib.request.Request(url, headers={"User-Agent": "perfect-arcade-games-mobygames-enricher/1.0"})
-        try:
-            with urllib.request.urlopen(req, timeout=30) as response:
-                status = response.status
-                payload = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as error:
-            status = error.code
-            body = error.read().decode("utf-8", errors="replace")
+            if self.max_requests is not None and self.uncached_requests >= self.max_requests:
+                raise RuntimeError(f"Reached --max-requests={self.max_requests}")
+
+            elapsed = time.time() - self.last_request_at
+            if self.last_request_at and elapsed < self.sleep_seconds:
+                time.sleep(self.sleep_seconds - elapsed)
+
+            req = urllib.request.Request(url, headers={"User-Agent": "perfect-arcade-games-mobygames-enricher/1.0"})
             try:
-                payload = json.loads(body)
-            except json.JSONDecodeError:
-                payload = {"error": body}
-            arcade_db.cache_put(self.conn, cache_key, url, status, payload)
-            self.conn.commit()
-            raise RuntimeError(f"MobyGames API error {status}: {payload}") from error
+                with urllib.request.urlopen(req, timeout=30) as response:
+                    status = response.status
+                    body = response.read().decode("utf-8")
+                    payload = json.loads(body)
+                break
+            except json.JSONDecodeError as error:
+                print(
+                    f"Temporary response parse error: {error}.",
+                    flush=True,
+                )
+                wait_with_status(network_retry_seconds)
+                network_retry_seconds = next_network_retry_seconds(network_retry_seconds)
+                continue
+            except urllib.error.HTTPError as error:
+                status = error.code
+                body = error.read().decode("utf-8", errors="replace")
+                try:
+                    payload = json.loads(body)
+                except json.JSONDecodeError:
+                    payload = {"error": body}
+
+                if status == 429:
+                    wait_seconds = rate_limit_wait_seconds(payload) + RATE_LIMIT_BUFFER_SECONDS
+                    print("Rate limit reached.", flush=True)
+                    self.last_request_at = time.time()
+                    wait_with_status(wait_seconds)
+                    continue
+
+                if status in TRANSIENT_HTTP_STATUSES:
+                    print(
+                        f"Temporary HTTP error {status}.",
+                        flush=True,
+                    )
+                    wait_with_status(network_retry_seconds)
+                    network_retry_seconds = next_network_retry_seconds(network_retry_seconds)
+                    continue
+
+                arcade_db.cache_put(self.conn, cache_key, url, status, payload)
+                self.conn.commit()
+                raise RuntimeError(f"MobyGames API error {status}: {payload}") from error
+            except NETWORK_ERRORS as error:
+                print(
+                    f"Network error: {type(error).__name__}: {error}",
+                    flush=True,
+                )
+                wait_with_status(network_retry_seconds)
+                network_retry_seconds = next_network_retry_seconds(network_retry_seconds)
+                continue
 
         self.last_request_at = time.time()
         self.uncached_requests += 1

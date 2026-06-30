@@ -18,7 +18,7 @@ from typing import Any, Iterable
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = SCRIPT_DIR / "perfect_arcade_games.sqlite"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def now_ts() -> int:
@@ -90,6 +90,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
           game_key TEXT PRIMARY KEY,
           usage_score REAL,
           moby_score_100 REAL,
+          catchup_score REAL,
           manual_score REAL,
           overall_score REAL,
           updated_at INTEGER NOT NULL,
@@ -131,6 +132,108 @@ def init_schema(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    conn.executescript(
+        """
+        DROP VIEW IF EXISTS v_mobygames_review;
+        DROP VIEW IF EXISTS v_mobygames_pending;
+        DROP VIEW IF EXISTS v_top_by_catchup;
+        DROP VIEW IF EXISTS v_top_by_playtime;
+        DROP VIEW IF EXISTS v_top_by_combined_60_40;
+        DROP VIEW IF EXISTS v_top_by_moby_score;
+        DROP VIEW IF EXISTS v_top_by_usage;
+        DROP VIEW IF EXISTS v_all_games;
+        DROP VIEW IF EXISTS v_active_games;
+
+        CREATE VIEW IF NOT EXISTS v_active_games AS
+        SELECT
+          g.game_key,
+          g.title,
+          g.system,
+          g.batocera_id,
+          g.md5,
+          g.path,
+          p.playcount,
+          p.gametime,
+          p.gametime_hours,
+          s.usage_score,
+          s.moby_score_100,
+          s.catchup_score,
+          s.manual_score,
+          s.overall_score,
+          m.match_status AS moby_match_status,
+          m.match_confidence AS moby_match_confidence,
+          m.moby_title,
+          m.moby_url
+        FROM games g
+        LEFT JOIN playtime p ON p.game_key = g.game_key
+        LEFT JOIN scores s ON s.game_key = g.game_key
+        LEFT JOIN mobygames_matches m ON m.game_key = g.game_key
+        WHERE g.favorite = 1
+          AND g.hidden = 0
+          AND g.file_exists = 1;
+
+        CREATE VIEW IF NOT EXISTS v_all_games AS
+        SELECT
+          ROW_NUMBER() OVER (ORDER BY title COLLATE NOCASE ASC, system COLLATE NOCASE ASC) AS rank,
+          *
+        FROM v_active_games;
+
+        CREATE VIEW IF NOT EXISTS v_top_by_usage AS
+        SELECT
+          ROW_NUMBER() OVER (ORDER BY usage_score DESC, title COLLATE NOCASE ASC) AS rank,
+          *
+        FROM v_active_games
+        WHERE usage_score IS NOT NULL;
+
+        CREATE VIEW IF NOT EXISTS v_top_by_moby_score AS
+        SELECT
+          ROW_NUMBER() OVER (ORDER BY moby_score_100 DESC, title COLLATE NOCASE ASC) AS rank,
+          *
+        FROM v_active_games
+        WHERE moby_score_100 IS NOT NULL;
+
+        CREATE VIEW IF NOT EXISTS v_top_by_playtime AS
+        SELECT
+          ROW_NUMBER() OVER (ORDER BY gametime DESC, playcount DESC, title COLLATE NOCASE ASC) AS rank,
+          *
+        FROM v_active_games
+        WHERE gametime IS NOT NULL;
+
+        CREATE VIEW IF NOT EXISTS v_top_by_combined_60_40 AS
+        SELECT
+          ROW_NUMBER() OVER (
+            ORDER BY ROUND((usage_score * 0.6) + (moby_score_100 * 0.4), 2) DESC, title COLLATE NOCASE ASC
+          ) AS rank,
+          *,
+          ROUND((usage_score * 0.6) + (moby_score_100 * 0.4), 2) AS combined_score
+        FROM v_active_games
+        WHERE usage_score IS NOT NULL
+          AND moby_score_100 IS NOT NULL;
+
+        CREATE VIEW IF NOT EXISTS v_top_by_catchup AS
+        SELECT
+          ROW_NUMBER() OVER (ORDER BY catchup_score DESC, moby_score_100 DESC, title COLLATE NOCASE ASC) AS rank,
+          *
+        FROM v_active_games
+        WHERE catchup_score IS NOT NULL;
+
+        CREATE VIEW IF NOT EXISTS v_mobygames_pending AS
+        SELECT
+          ROW_NUMBER() OVER (ORDER BY usage_score DESC, gametime DESC, title COLLATE NOCASE ASC) AS rank,
+          *
+        FROM v_active_games
+        WHERE moby_match_status IS NULL;
+
+        CREATE VIEW IF NOT EXISTS v_mobygames_review AS
+        SELECT
+          ROW_NUMBER() OVER (ORDER BY moby_match_confidence ASC, title COLLATE NOCASE ASC) AS rank,
+          *
+        FROM v_active_games
+        WHERE moby_match_status = 'review';
+        """
+    )
+    ensure_column(conn, "scores", "catchup_score", "REAL")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_scores_catchup ON scores(catchup_score DESC)")
     conn.execute(
         """
         INSERT INTO schema_meta(key, value)
@@ -140,6 +243,15 @@ def init_schema(conn: sqlite3.Connection) -> None:
         (str(SCHEMA_VERSION),),
     )
     conn.commit()
+
+
+def ensure_column(conn: sqlite3.Connection, table_name: str, column_name: str, column_type: str) -> None:
+    columns = {
+        row["name"]
+        for row in conn.execute(f"PRAGMA table_info({table_name})")
+    }
+    if column_name not in columns:
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
 
 
 def build_game_key(system: str, md5: str = "", batocera_id: str = "", path: str = "", norm_title: str = "") -> str:
@@ -355,6 +467,27 @@ def upsert_mobygames_match(
     )
 
 
+def update_catchup_scores(conn: sqlite3.Connection) -> None:
+    ts = now_ts()
+    for row in conn.execute("SELECT game_key, usage_score, moby_score_100 FROM scores"):
+        usage_score = row["usage_score"]
+        moby_score_100 = row["moby_score_100"]
+        if usage_score is None or moby_score_100 is None:
+            catchup_score = None
+        else:
+            usage_factor = max(0.0, min(1.0, float(usage_score) / 100.0))
+            catchup_score = round(float(moby_score_100) * (1.0 - usage_factor), 2)
+
+        conn.execute(
+            """
+            UPDATE scores
+            SET catchup_score = ?, updated_at = ?
+            WHERE game_key = ?
+            """,
+            (catchup_score, ts, row["game_key"]),
+        )
+
+
 def update_overall_scores(
     conn: sqlite3.Connection,
     *,
@@ -363,6 +496,7 @@ def update_overall_scores(
     manual_weight: float = 0.20,
 ) -> None:
     ts = now_ts()
+    update_catchup_scores(conn)
     for row in conn.execute("SELECT game_key, usage_score, moby_score_100, manual_score FROM scores"):
         weighted_sum = 0.0
         used_weight = 0.0
@@ -407,11 +541,16 @@ def cache_put(conn: sqlite3.Connection, cache_key: str, url: str, status: int, r
     )
 
 
+def cache_delete(conn: sqlite3.Connection, cache_key: str) -> None:
+    conn.execute("DELETE FROM api_cache WHERE cache_key = ?", (cache_key,))
+
+
 def top_games(conn: sqlite3.Connection, limit: int = 250, order_by: str = "overall_score") -> list[sqlite3.Row]:
     allowed = {
         "overall_score": "s.overall_score",
         "usage_score": "s.usage_score",
         "moby_score_100": "s.moby_score_100",
+        "catchup_score": "s.catchup_score",
         "gametime": "p.gametime",
         "playcount": "p.playcount",
     }
@@ -434,6 +573,7 @@ def top_games(conn: sqlite3.Connection, limit: int = 250, order_by: str = "overa
               p.gametime_hours,
               s.usage_score,
               s.moby_score_100,
+              s.catchup_score,
               s.manual_score,
               s.overall_score,
               m.match_status AS moby_match_status,

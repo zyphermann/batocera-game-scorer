@@ -45,6 +45,11 @@ SCHEMAS = {
         "description": "MobyGames-Score dominiert, lokale Nutzung bricht Gleichstaende.",
         "weights": {"moby_score_100": 0.75, "playcount_norm": 0.15, "gametime_norm": 0.10},
     },
+    "catchup": {
+        "label": "Catch-up Queue",
+        "description": "Hoher MobyGames-Score bei niedriger eigener Nutzung.",
+        "weights": {"catchup_score": 1.00},
+    },
     "balanced": {
         "label": "Balanced",
         "description": "Ausgewogener Gesamtscore aus Nutzung und MobyGames.",
@@ -62,6 +67,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top", type=int, default=250, help="Number of games to export.")
     parser.add_argument("--schema", choices=SCHEMAS.keys(), default=DEFAULT_SCHEMA, help="Ranking schema.")
     parser.add_argument("--list-schemas", action="store_true", help="List available ranking schemas and exit.")
+    parser.add_argument("--refresh-scores", action="store_true", help="Refresh derived DB scores before exporting.")
     parser.add_argument("--include-review", action="store_true", help="Include MobyGames matches marked as review.")
     parser.add_argument("--matched-only", action="store_true", help="Only export rows with match_status = matched.")
     return parser.parse_args()
@@ -93,6 +99,7 @@ def get_export_candidates(conn: sqlite3.Connection) -> list[sqlite3.Row]:
               p.gametime_hours,
               s.usage_score,
               s.moby_score_100,
+              s.catchup_score,
               s.manual_score,
               s.overall_score,
               m.match_status AS moby_match_status,
@@ -118,6 +125,7 @@ def score_row(row: sqlite3.Row, schema_name: str, max_playcount: int, max_gameti
         "gametime_norm": log_normalized(row["gametime"], max_gametime),
         "usage_score": row["usage_score"],
         "moby_score_100": row["moby_score_100"],
+        "catchup_score": row["catchup_score"],
         "manual_score": row["manual_score"],
         "overall_score": row["overall_score"],
     }
@@ -150,6 +158,10 @@ def export_rows(args: argparse.Namespace) -> int:
         raise FileNotFoundError(f"Database not found: {db_path}")
 
     conn = arcade_db.connect_db(db_path)
+    if args.refresh_scores:
+        arcade_db.update_usage_scores(conn)
+        arcade_db.update_overall_scores(conn)
+        conn.commit()
     rows = get_export_candidates(conn)
     conn.close()
 
@@ -191,6 +203,7 @@ def export_rows(args: argparse.Namespace) -> int:
         "gametime_hours",
         "usage_score",
         "moby_score_100",
+        "catchup_score",
         "manual_score",
         "overall_score",
         "moby_match_status",
@@ -219,6 +232,7 @@ def export_rows(args: argparse.Namespace) -> int:
                     "gametime_hours": row["gametime_hours"],
                     "usage_score": row["usage_score"],
                     "moby_score_100": row["moby_score_100"],
+                    "catchup_score": row["catchup_score"],
                     "manual_score": row["manual_score"],
                     "overall_score": row["overall_score"],
                     "moby_match_status": row["moby_match_status"],

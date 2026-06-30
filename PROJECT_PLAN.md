@@ -435,6 +435,70 @@ Das Skript:
 
 Das Skript kann jederzeit mit `Ctrl+C` beendet werden. Beim naechsten Start macht es bei den noch offenen Spielen weiter.
 
+Wenn die MobyGames-API das Stundenlimit meldet (`HTTP 429`), wartet das Skript automatisch die von der API gemeldete Zeit plus kleinen Puffer ab und versucht denselben Request erneut. Der Fehler wird nicht im Cache gespeichert, weil es nur ein temporaeres Rate-Limit ist.
+
+Beispielmeldung:
+
+```text
+Rate limit reached.
+Waiting 1359 seconds before retrying...
+Waiting 1349 seconds before retrying...
+Waiting 1339 seconds before retrying...
+```
+
+Das ist kein Fehler. Das Skript gibt waehrend der Wartezeit alle 10 Sekunden den aktuellen Rest-Countdown aus und macht danach automatisch weiter.
+
+Bei schwachem WLAN koennen ausserdem Timeouts, TLS-Fehler oder abgebrochene HTTP-Antworten auftreten. Diese werden ebenfalls nicht als endgueltiger Fehler behandelt. Das Skript wartet zuerst 30 Sekunden, danach bei wiederholten Netzwerkproblemen mit Backoff bis maximal 300 Sekunden, und versucht denselben Request erneut.
+
+Beispiel:
+
+```text
+Network error: TimeoutError: ...
+Waiting 30 seconds before retrying...
+Waiting 20 seconds before retrying...
+Waiting 10 seconds before retrying...
+```
+
+Fuer lange 24/7-Laeufe sollte das Skript nicht in einer normalen SSH-Session ohne Schutz laufen, weil der Prozess beim Schliessen der Verbindung beendet werden kann. Besser mit `tmux`, falls auf Batocera verfuegbar:
+
+```bash
+tmux new -s moby
+cd /userdata/scoring
+python3 enrich_mobygames.py
+```
+
+`tmux`-Session verlassen, ohne das Skript zu stoppen:
+
+```text
+Ctrl+B, dann D
+```
+
+Wieder verbinden:
+
+```bash
+tmux attach -t moby
+```
+
+Falls `tmux` nicht installiert ist, kann alternativ `screen` funktionieren:
+
+```bash
+screen -S moby
+cd /userdata/scoring
+python3 enrich_mobygames.py
+```
+
+`screen` verlassen, ohne zu stoppen:
+
+```text
+Ctrl+A, dann D
+```
+
+Wieder verbinden:
+
+```bash
+screen -r moby
+```
+
 Wenn ein bereits gematchtes Spiel bewusst neu verarbeitet werden soll:
 
 ```bash
@@ -551,6 +615,7 @@ Aktuelle Schemata:
 - `playtime_focus`: primaer nach Spielzeit.
 - `replay_focus`: primaer nach Anzahl der Starts.
 - `critic_favorites`: MobyGames-Score dominiert, lokale Nutzung bricht Gleichstaende.
+- `catchup`: Nachholbedarf, also hoher MobyGames-Score bei niedriger eigener Nutzung.
 - `balanced`: ausgewogener Mix aus `usage_score` und `moby_score_100`.
 
 Top 250 mit dem Standard-Schema `quality_mix` exportieren:
@@ -582,6 +647,75 @@ Top 250 nach Starts:
 
 ```bash
 python3 export_games.py --top 250 --schema replay_focus --output top_250_replay.csv
+```
+
+Top 250 nach Nachholbedarf:
+
+```bash
+python3 export_games.py --top 250 --schema catchup --refresh-scores --output top_250_catchup.csv
+```
+
+Der Nachholbedarf wird in `scores.catchup_score` gespeichert:
+
+```text
+catchup_score = moby_score_100 * (1 - usage_score / 100)
+```
+
+Interpretation:
+
+- hoher MobyGames-Score
+- niedriger eigener `usage_score`
+- ergibt hohen Nachholbedarf
+
+Bereits viel gespielte Spiele fallen automatisch nach unten, auch wenn sie sehr gut bewertet sind.
+
+Direkt per SQLite:
+
+```sql
+SELECT
+  g.title,
+  g.system,
+  s.usage_score,
+  s.moby_score_100,
+  s.catchup_score,
+  m.moby_title,
+  m.moby_url
+FROM games g
+JOIN scores s ON s.game_key = g.game_key
+LEFT JOIN mobygames_matches m ON m.game_key = g.game_key
+WHERE g.favorite = 1
+  AND g.hidden = 0
+  AND g.file_exists = 1
+  AND s.catchup_score IS NOT NULL
+ORDER BY s.catchup_score DESC, s.moby_score_100 DESC, g.title COLLATE NOCASE ASC
+LIMIT 100;
+```
+
+Top 250 nach Nachholbedarf direkt aus der Shell:
+
+```bash
+sqlite3 -header -column /userdata/scoring/perfect_arcade_games.sqlite "
+SELECT
+  g.title,
+  g.system,
+  p.playcount,
+  p.gametime_hours,
+  s.usage_score,
+  s.moby_score_100,
+  s.catchup_score,
+  m.moby_title,
+  m.moby_url
+FROM games g
+JOIN playtime p ON p.game_key = g.game_key
+JOIN scores s ON s.game_key = g.game_key
+LEFT JOIN mobygames_matches m ON m.game_key = g.game_key
+WHERE g.favorite = 1
+  AND g.hidden = 0
+  AND g.file_exists = 1
+  AND s.catchup_score IS NOT NULL
+ORDER BY s.catchup_score DESC, s.moby_score_100 DESC, g.title COLLATE NOCASE ASC
+LIMIT 250;
+"
 ```
 
 Standardmaessig werden MobyGames-Matches mit Status `review` nicht exportiert. Wenn diese trotzdem in der CSV stehen sollen:
@@ -645,6 +779,546 @@ Wenn ein Testscan mit Teilordnern gemacht wird, immer `--no-reset` verwenden, da
 
 ```bash
 python3 scan_batocera_playtime.py --root /pfad/zum/test --no-reset
+```
+
+## Lokaler Webserver
+
+`web_dashboard.py` stellt ein kleines lokales Dashboard bereit, um die SQLite-Datenbank im Browser anzuschauen und Aktionen zu starten.
+
+Start auf Batocera:
+
+```bash
+cd /userdata/scoring
+python3 web_dashboard.py
+```
+
+Start ueber das Autostart-Helferskript:
+
+```bash
+cd /userdata/scoring
+chmod +x dashboard_autostart.sh
+./dashboard_autostart.sh start
+```
+
+Status pruefen:
+
+```bash
+./dashboard_autostart.sh status
+```
+
+Stoppen:
+
+```bash
+./dashboard_autostart.sh stop
+```
+
+Logs:
+
+```bash
+tail -f /userdata/scoring/logs/web_dashboard.log
+```
+
+### Dashboard beim Batocera-Start automatisch starten
+
+Batocera kann eigene Boot-Kommandos ueber `/userdata/system/custom.sh` ausfuehren. Dazu das Autostart-Skript aus `/userdata/scoring` dort einhaengen:
+
+```bash
+mkdir -p /userdata/system
+cat >> /userdata/system/custom.sh <<'EOF'
+
+# Start local scoring dashboard
+/userdata/scoring/dashboard_autostart.sh start
+EOF
+chmod +x /userdata/system/custom.sh
+```
+
+Danach beim naechsten Batocera-Start automatisch erreichbar:
+
+```text
+http://BATOCERA-IP:8765
+```
+
+Wenn der Port geaendert werden soll, kann man Umgebungsvariablen in `custom.sh` setzen:
+
+```bash
+DASHBOARD_PORT=8080 /userdata/scoring/dashboard_autostart.sh start
+```
+
+Danach im Browser eines Rechners im selben Netzwerk oeffnen:
+
+```text
+http://BATOCERA-IP:8765
+```
+
+Beispiel:
+
+```text
+http://192.168.1.50:8765
+```
+
+Die IP-Adresse von Batocera kann man z. B. so anzeigen:
+
+```bash
+ip addr
+```
+
+Oder im Batocera-Menue unter den Netzwerkeinstellungen nachsehen.
+
+Das Dashboard kann:
+
+- Statistik-Karten anzeigen
+- Views wie `v_all_games`, `v_top_by_catchup`, `v_top_by_playtime`, `v_top_by_moby_score` und `v_mobygames_pending` anzeigen
+- Spalten per Klick auf die Tabellenkoepfe sortieren
+- seitenweise durch lange Tabellen blaettern
+- per Suchfeld nach `title` und `system` filtern
+- Spiele ueber Batoceras `configgen.emulatorlauncher` starten
+- laufende Emulatorprozesse per Stop-Button beenden
+- Spielzeiten aktualisieren
+- Scores neu berechnen
+- MobyGames-Enrichment mit Limit im Hintergrund starten
+- Job-Logs anzeigen
+
+Fuer laengeren Betrieb am besten in `tmux` starten:
+
+```bash
+tmux new -s scoring-web
+cd /userdata/scoring
+python3 web_dashboard.py
+```
+
+`tmux` verlassen, ohne den Webserver zu stoppen:
+
+```text
+Ctrl+B, dann D
+```
+
+Wieder verbinden:
+
+```bash
+tmux attach -t scoring-web
+```
+
+Alternative mit anderem Port:
+
+```bash
+python3 web_dashboard.py --port 8080
+```
+
+Nur lokal auf Batocera binden, nicht im Netzwerk:
+
+```bash
+python3 web_dashboard.py --host 127.0.0.1
+```
+
+Dashboard-URL mit Suche, Sortierung und Pagination:
+
+```text
+http://BATOCERA-IP:8765/?view=v_all_games&q=switch&sort=playcount&dir=desc&page=1&limit=100
+```
+
+Das Suchfeld `q` wirkt auf:
+
+- `title`
+- `system`
+
+### Spiele aus dem Dashboard starten
+
+Pro Tabellenzeile gibt es einen `Launch`-Button. Dieser nutzt auf Batocera den gleichen Launcher-Pfad, der auch aus SSH erfolgreich getestet wurde:
+
+```bash
+DISPLAY=:0 /usr/bin/python /usr/bin/emulatorlauncher -system SYSTEM -rom ROM_PATH
+```
+
+Das Dashboard startet den Prozess im Hintergrund, damit die Weboberflaeche weiter erreichbar bleibt.
+
+Ein laufendes Spiel kann ueber den Button `Stop Game` beendet werden. Intern wird zuerst `SIGINT` an die Launcher-Prozessgruppe geschickt. Das entspricht dem sauberen Abbruch aus dem SSH-Terminal und gibt Batocera die Chance, Emulator, `evmapy` und Aufloesung korrekt aufzuraeumen.
+
+Nur wenn der Launcher nicht reagiert, folgen Fallbacks mit `SIGTERM` und danach typische Emulatorprozesse per `pkill -f`, z. B.:
+
+```text
+retroarch
+duckstation
+pcsx2
+ppsspp
+dolphin-emu
+mupen64plus
+ryujinx
+yuzu
+suyu
+eden
+citron
+```
+
+Normaler Batocera-Weg zum Beenden bleibt weiterhin:
+
+```text
+Hotkey + Start
+```
+
+Wenn ein Emulator hart beendet wird, kann Batocera gelegentlich mit falscher Aufloesung zu EmulationStation zurueckkehren. Der Stop-Button versucht deshalb nach dem Beenden einen Display-Reset:
+
+```bash
+batocera-resolution setMode max-1920x1080
+```
+
+Fallback:
+
+```bash
+batocera-resolution setMode max
+```
+
+Manuelle Recovery per SSH:
+
+```bash
+DISPLAY=:0 batocera-resolution setMode max-1920x1080
+```
+
+oder:
+
+```bash
+DISPLAY=:0 batocera-resolution setMode max
+```
+
+### Switch-Launch-Fehler: no generator found
+
+Wenn ein Switch-Spiel mit einem Fehler wie diesem sofort beendet wird:
+
+```text
+Exception: no generator found for emulator ryujinx-continuous
+```
+
+dann kommt der Fehler aus Batoceras Emulator-Konfiguration, nicht aus dem Dashboard. Im Log sieht man dann z. B.:
+
+```text
+Settings: {'emulator': 'ryujinx-continuous', 'core': 'ryujinx-continuous', ...}
+ModuleNotFoundError: No module named 'configgen.generators.ryujinx-continuous'
+```
+
+Batocera versucht in diesem Fall einen Generator namens `ryujinx-continuous` zu laden, der auf dem System nicht vorhanden ist.
+
+Pruefen:
+
+```bash
+grep -n "switch.*emulator\\|switch.*core" /userdata/system/batocera.conf
+ls /usr/lib/python3.11/site-packages/configgen/generators | grep -i "ryu\\|yuzu\\|switch"
+```
+
+Danach in EmulationStation fuer Switch einen vorhandenen Emulator/Core setzen oder die betreffenden `switch.emulator` / `switch.core` Eintraege in `/userdata/system/batocera.conf` korrigieren. Nach einer Aenderung EmulationStation neu starten oder Batocera rebooten.
+
+```bash
+/etc/init.d/S31emulationstation restart
+```
+
+Sicherheitshinweis: Der Webserver kann lokal Programme starten und beenden. Er sollte nur im vertrauenswuerdigen Heimnetz laufen und nicht ins Internet weitergeleitet werden.
+
+## Beispiel-Queries
+
+Alle Queries koennen direkt auf Batocera ausgefuehrt werden.
+
+Die wichtigsten Abfragen werden zusaetzlich als SQLite-Views angelegt, sobald ein Skript `arcade_db.py` laedt, z. B.:
+
+```bash
+cd /userdata/scoring
+python3 export_games.py --list-schemas
+```
+
+Danach sind diese Views verfuegbar:
+
+- `v_active_games`
+- `v_all_games`
+- `v_top_by_usage`
+- `v_top_by_playtime`
+- `v_top_by_moby_score`
+- `v_top_by_combined_60_40`
+- `v_top_by_catchup`
+- `v_mobygames_pending`
+- `v_mobygames_review`
+
+### Views verwenden
+
+Alle aktiven Spiele:
+
+```bash
+sqlite3 -header -column /userdata/scoring/perfect_arcade_games.sqlite "
+SELECT
+  rank,
+  title,
+  system,
+  playcount,
+  gametime_hours,
+  usage_score,
+  moby_score_100,
+  catchup_score,
+  overall_score,
+  moby_match_status
+FROM v_all_games
+LIMIT 250;
+"
+```
+
+Top 250 nach Nachholbedarf:
+
+```bash
+sqlite3 -header -column /userdata/scoring/perfect_arcade_games.sqlite "
+SELECT
+  rank,
+  title,
+  system,
+  playcount,
+  gametime_hours,
+  usage_score,
+  moby_score_100,
+  catchup_score,
+  moby_title,
+  moby_url
+FROM v_top_by_catchup
+LIMIT 250;
+"
+```
+
+Top 250 nach Spielzeit:
+
+```bash
+sqlite3 -header -column /userdata/scoring/perfect_arcade_games.sqlite "
+SELECT
+  rank,
+  title,
+  system,
+  gametime_hours,
+  playcount,
+  usage_score
+FROM v_top_by_playtime
+LIMIT 250;
+"
+```
+
+Top 100 nach MobyGames-Score:
+
+```bash
+sqlite3 -header -column /userdata/scoring/perfect_arcade_games.sqlite "
+SELECT
+  rank,
+  title,
+  system,
+  moby_score_100,
+  moby_title,
+  moby_match_confidence,
+  moby_url
+FROM v_top_by_moby_score
+LIMIT 100;
+"
+```
+
+Top 100 nach kombinierter Formel 60/40:
+
+```bash
+sqlite3 -header -column /userdata/scoring/perfect_arcade_games.sqlite "
+SELECT
+  rank,
+  title,
+  system,
+  usage_score,
+  moby_score_100,
+  combined_score
+FROM v_top_by_combined_60_40
+LIMIT 100;
+"
+```
+
+Noch nicht mit MobyGames bearbeitete Spiele:
+
+```bash
+sqlite3 -header -column /userdata/scoring/perfect_arcade_games.sqlite "
+SELECT
+  rank,
+  title,
+  system,
+  usage_score,
+  playcount,
+  gametime_hours
+FROM v_mobygames_pending
+LIMIT 100;
+"
+```
+
+Unsichere MobyGames-Matches:
+
+```bash
+sqlite3 -header -column /userdata/scoring/perfect_arcade_games.sqlite "
+SELECT
+  rank,
+  title,
+  system,
+  moby_match_status,
+  moby_match_confidence,
+  moby_title,
+  moby_url
+FROM v_mobygames_review
+LIMIT 100;
+"
+```
+
+### Anzahl Spiele
+
+```bash
+sqlite3 /userdata/scoring/perfect_arcade_games.sqlite "
+SELECT COUNT(*) AS games
+FROM games
+WHERE favorite = 1
+  AND hidden = 0
+  AND file_exists = 1;
+"
+```
+
+### Anzahl MobyGames-Matches
+
+```bash
+sqlite3 /userdata/scoring/perfect_arcade_games.sqlite "
+SELECT COUNT(*) AS moby_matches
+FROM mobygames_matches;
+"
+```
+
+### Top 100 nach MobyGames-Score
+
+```bash
+sqlite3 -header -column /userdata/scoring/perfect_arcade_games.sqlite "
+SELECT
+  g.title,
+  g.system,
+  s.moby_score_100,
+  m.moby_title,
+  m.match_confidence,
+  m.moby_url
+FROM games g
+JOIN scores s ON s.game_key = g.game_key
+LEFT JOIN mobygames_matches m ON m.game_key = g.game_key
+WHERE g.favorite = 1
+  AND g.hidden = 0
+  AND g.file_exists = 1
+  AND s.moby_score_100 IS NOT NULL
+ORDER BY s.moby_score_100 DESC, g.title COLLATE NOCASE ASC
+LIMIT 100;
+"
+```
+
+### Top 100 nach Usage-Score
+
+```bash
+sqlite3 -header -column /userdata/scoring/perfect_arcade_games.sqlite "
+SELECT
+  g.title,
+  g.system,
+  p.playcount,
+  p.gametime_hours,
+  s.usage_score
+FROM games g
+JOIN playtime p ON p.game_key = g.game_key
+JOIN scores s ON s.game_key = g.game_key
+WHERE g.favorite = 1
+  AND g.hidden = 0
+  AND g.file_exists = 1
+  AND s.usage_score IS NOT NULL
+ORDER BY s.usage_score DESC, g.title COLLATE NOCASE ASC
+LIMIT 100;
+"
+```
+
+### Top 100 nach kombinierter Formel
+
+Formel:
+
+```text
+usage_score * 0.6 + moby_score_100 * 0.4
+```
+
+```bash
+sqlite3 -header -column /userdata/scoring/perfect_arcade_games.sqlite "
+SELECT
+  g.title,
+  g.system,
+  s.usage_score,
+  s.moby_score_100,
+  ROUND((s.usage_score * 0.6) + (s.moby_score_100 * 0.4), 2) AS combined_score
+FROM games g
+JOIN scores s ON s.game_key = g.game_key
+WHERE g.favorite = 1
+  AND g.hidden = 0
+  AND g.file_exists = 1
+  AND s.usage_score IS NOT NULL
+  AND s.moby_score_100 IS NOT NULL
+ORDER BY combined_score DESC, g.title COLLATE NOCASE ASC
+LIMIT 100;
+"
+```
+
+### Top 250 nach Nachholbedarf
+
+```bash
+sqlite3 -header -column /userdata/scoring/perfect_arcade_games.sqlite "
+SELECT
+  g.title,
+  g.system,
+  p.playcount,
+  p.gametime_hours,
+  s.usage_score,
+  s.moby_score_100,
+  s.catchup_score,
+  m.moby_title,
+  m.moby_url
+FROM games g
+JOIN playtime p ON p.game_key = g.game_key
+JOIN scores s ON s.game_key = g.game_key
+LEFT JOIN mobygames_matches m ON m.game_key = g.game_key
+WHERE g.favorite = 1
+  AND g.hidden = 0
+  AND g.file_exists = 1
+  AND s.catchup_score IS NOT NULL
+ORDER BY s.catchup_score DESC, s.moby_score_100 DESC, g.title COLLATE NOCASE ASC
+LIMIT 250;
+"
+```
+
+### Noch nicht mit MobyGames bearbeitete Spiele
+
+```bash
+sqlite3 -header -column /userdata/scoring/perfect_arcade_games.sqlite "
+SELECT
+  g.title,
+  g.system,
+  s.usage_score,
+  p.playcount,
+  p.gametime_hours
+FROM games g
+JOIN playtime p ON p.game_key = g.game_key
+LEFT JOIN scores s ON s.game_key = g.game_key
+LEFT JOIN mobygames_matches m ON m.game_key = g.game_key
+WHERE g.favorite = 1
+  AND g.hidden = 0
+  AND g.file_exists = 1
+  AND m.game_key IS NULL
+ORDER BY s.usage_score DESC, p.gametime DESC, g.title COLLATE NOCASE ASC
+LIMIT 100;
+"
+```
+
+### Unsichere MobyGames-Matches pruefen
+
+```bash
+sqlite3 -header -column /userdata/scoring/perfect_arcade_games.sqlite "
+SELECT
+  g.title,
+  g.system,
+  m.match_status,
+  m.match_confidence,
+  m.moby_title,
+  m.moby_url
+FROM games g
+JOIN mobygames_matches m ON m.game_key = g.game_key
+WHERE m.match_status = 'review'
+ORDER BY m.match_confidence ASC, g.title COLLATE NOCASE ASC
+LIMIT 100;
+"
 ```
 
 ## Batocera-41-Kontext
